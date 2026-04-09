@@ -330,6 +330,18 @@ LOAD_KV_SIZE_BLOCKS = Counter(
     'vllm_kv_cache_load_blocks_total',
     'Total number of KV cache blocks loaded from CPU to TPU')
 
+SAVE_KV_SIZE_BLOCKS = Counter(
+    'vllm_kv_cache_save_blocks_total',
+    'Total number of KV cache blocks saved from TPU to CPU')
+
+CPU_HIT_BLOCKS = Counter(
+    'vllm_kv_cache_cpu_hit_blocks_total',
+    'Total number of KV cache blocks that were hits in CPU and loaded to TPU')
+
+HBM_HIT_BLOCKS = Counter(
+    'vllm_kv_cache_hbm_hit_blocks_total',
+    'Total number of KV cache blocks that were hits in HBM (already computed)')
+
 STAGING_BUFFER_BLOCKS_FOR_SAVE = Gauge(
     'vllm_kv_cache_staging_buffer_blocks_for_save_total',
     'Total occupied staging blocks for save')
@@ -834,6 +846,10 @@ class TPUOffloadConnectorScheduler():
         # {reqid: total_num_matched_tokens_in_cpu_backend}
         self._external_cache_hits: dict[ReqId, int] = {}
 
+        self.total_blocks_hit = 0
+        self.total_blocks_hit_on_hbm = 0
+        self.total_blocks_hit_on_cpu = 0
+
         # request ID -> set(block hashes being saved/loaded)
         self._reqs_being_saved = defaultdict[ReqId, set[CpuChunkId]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[CpuChunkId]](set)
@@ -914,6 +930,10 @@ class TPUOffloadConnectorScheduler():
         logger.info(
             f"Request {request.request_id}: Found {num_matched_tokens} (out of {request.num_tokens} existing tokens) matched tokens ({num_matched_blocks} blocks) in CPU backend (computed_blocks: {num_computed_blocks}, blocks_to_load: {num_blocks_to_load})."
         )
+
+        self.total_blocks_hit += num_matched_blocks
+        self.total_blocks_hit_on_hbm += num_computed_blocks
+        self.total_blocks_hit_on_cpu += num_blocks_to_load
 
         if num_blocks_to_load > 0:
             KV_HIT_WITH_LOAD.inc()
@@ -1017,6 +1037,9 @@ class TPUOffloadConnectorScheduler():
             num_blocks_to_load = len(load_spec.src_chunks)
             num_matched_blocks = num_blocks_to_load + skip_leading_blocks
             assert num_matched_blocks == load_spec.num_matched_tokens // self.block_size, f"{num_matched_blocks} != {load_spec.num_matched_tokens} // {self.block_size}"
+
+            CPU_HIT_BLOCKS.inc(num_blocks_to_load)
+            HBM_HIT_BLOCKS.inc(skip_leading_blocks)
 
             block_hashes = self._get_request_block_hashes(request)
             all_blocks = blocks.get_block_ids()[0]
@@ -1638,6 +1661,13 @@ class TPUOffloadConnectorScheduler():
 
         if not delay_free:
             logger.info(f" finished request: {req_id}")
+            ratio_cpu_hbm = self.total_blocks_hit_on_cpu / self.total_blocks_hit_on_hbm if self.total_blocks_hit_on_hbm > 0 else 0.0
+            ratio_cpu_total = self.total_blocks_hit_on_cpu / self.total_blocks_hit if self.total_blocks_hit > 0 else 0.0
+            logger.info(
+                f"Offload Stats (Scheduler): Total hits: {self.total_blocks_hit}, "
+                f"HBM hits: {self.total_blocks_hit_on_hbm}, CPU hits: {self.total_blocks_hit_on_cpu}, "
+                f"Ratio (CPU/HBM): {ratio_cpu_hbm:.4f}, Ratio (CPU/Total): {ratio_cpu_total:.4f}"
+            )
             self._save_reqs_w_pending_gather.pop(req_id, None)
             self._reqs_being_loaded.pop(req_id, None)
 
@@ -1708,6 +1738,10 @@ class TPUOffloadConnectorWorker:
 
         # record finished save / load blocks (with req_ids) for each iteration
         self.offload_stats = KVOffloadConnectorStats()
+
+        self.total_blocks_hit = 0
+        self.total_blocks_hit_on_hbm = 0
+        self.total_blocks_hit_on_cpu = 0
 
         self.no_op_load = os.getenv("TPU_OFFLOAD_NO_OP_LOAD", "0") == "1"
         self.no_op_gather = os.getenv("TPU_OFFLOAD_NO_OP_GATHER", "0") == "1"
@@ -2076,6 +2110,7 @@ class TPUOffloadConnectorWorker:
             )
 
         # We return the data needed for the next phase
+        SAVE_KV_SIZE_BLOCKS.inc(num_blocks_to_save)
         return gathered_kv_caches_tpu, num_blocks_to_save, dst_chunks, blocks_to_save
 
     def _batched_gather_tpu_blocks(
@@ -2177,6 +2212,7 @@ class TPUOffloadConnectorWorker:
                 f"extracted_blocks_tpu (batch): {gathered_kv_caches_tpu[0].shape}, {gathered_kv_caches_tpu[0].sharding}"
             )
 
+        SAVE_KV_SIZE_BLOCKS.inc(total_num_blocks_to_save)
         return gathered_kv_caches_tpu, manifest, total_num_blocks_to_save
 
     def _transfer_and_register_cpu_chunks(self,
@@ -2692,4 +2728,9 @@ class TPUOffloadConnectorWorker:
         finished_loads = set()
         logger.debug(f"Finished saves: {finished_saves}, "
                      f"Finished loads: {finished_loads}")
+
+        ratio_cpu_hbm = self.total_blocks_hit_on_cpu / self.total_blocks_hit_on_hbm if self.total_blocks_hit_on_hbm > 0 else 0.0
+        ratio_cpu_total = self.total_blocks_hit_on_cpu / self.total_blocks_hit if self.total_blocks_hit > 0 else 0.0
+        logger.info(f"Offload Stats: Total hits: {self.total_blocks_hit}, HBM hits: {self.total_blocks_hit_on_hbm}, CPU hits: {self.total_blocks_hit_on_cpu}, Ratio (CPU/HBM): {ratio_cpu_hbm:.4f}, Ratio (CPU/Total): {ratio_cpu_total:.4f}")
+
         return finished_saves, finished_loads

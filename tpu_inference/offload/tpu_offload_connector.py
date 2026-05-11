@@ -1274,6 +1274,8 @@ class TPUOffloadConnectorWorker:
 
         self.host_memory_kind = "unpinned_host" if envs.TPU_OFFLOAD_USE_UNPINNED_HOST else "pinned_host"
         logger.info("Host memory kind : %s", self.host_memory_kind)
+        self.remove_load_swap_block = envs.TPU_OFFLOAD_REMOVE_LOAD_SWAP_BLOCK
+        self.remove_load_scatter_block = envs.TPU_OFFLOAD_REMOVE_LOAD_SCATTER_BLOCK
 
     def __del__(self):
         logger.info("TPUOffloadConnectorWorker: Entering __del__")
@@ -2106,7 +2108,10 @@ class TPUOffloadConnectorWorker:
                 raw_chunked_kv_on_tpu.append(
                     jax.device_put(assembled_kv_on_cpu[i],
                                    self.expanded_device_sharding))
-            jax.block_until_ready(raw_chunked_kv_on_tpu)
+            if self.remove_load_swap_block:
+                logger.info("Remove load swap block")
+            else:
+                jax.block_until_ready(raw_chunked_kv_on_tpu)
 
             update_kv_start = time.time()
             if self.use_bucketed_swap_ops:
@@ -2124,7 +2129,10 @@ class TPUOffloadConnectorWorker:
                     self.cached_kv_sharding_spec,
                     self.indices_sharding,
                 )
-            jax.block_until_ready(self.runner.kv_caches)
+            if self.remove_load_scatter_block:
+                logger.info("Remove load scatter block")
+            else:
+                jax.block_until_ready(self.runner.kv_caches)
             update_duration = time.time() - update_kv_start
             logger.debug(
                 f"Request {meta.req_id}: Loaded {num_tokens_to_load_delta} tokens into "

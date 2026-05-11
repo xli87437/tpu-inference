@@ -52,6 +52,8 @@ if TYPE_CHECKING:
     TPU_OFFLOAD_USE_UNPINNED_HOST: bool = False
     MOE_APPROX_TOPK: bool = False
     MOE_APPROX_TOPK_RECALL_TARGET: float | None = None
+    TPU_OFFLOAD_REMOVE_LOAD_SWAP_BLOCK: bool = False
+    TPU_OFFLOAD_REMOVE_LOAD_SCATTER_BLOCK: bool = False
 
 
 def env_with_choices(
@@ -298,6 +300,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: float(os.getenv("MOE_APPROX_TOPK_RECALL_TARGET", "0.9")),
     "DISABLE_WEIGHT_REQUANTIZATION":
     env_bool("DISABLE_WEIGHT_REQUANTIZATION", default=False),
+    "TPU_OFFLOAD_REMOVE_LOAD_SWAP_BLOCK":
+    lambda: bool(int(os.getenv("TPU_OFFLOAD_REMOVE_LOAD_SWAP_BLOCK", "0"))),
+    "TPU_OFFLOAD_REMOVE_LOAD_SCATTER_BLOCK":
+    lambda: bool(int(os.getenv("TPU_OFFLOAD_REMOVE_LOAD_SCATTER_BLOCK", "0"))),
 }
 
 
